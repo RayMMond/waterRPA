@@ -1,0 +1,6 @@
+pyautogui==0.9.54
+pyperclip==1.11.0
+pyside6==6.10.0
+pyside6_addons==6.10.0
+pyside6_essentials==6.10.0
+opencv-python

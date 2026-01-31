@@ -5,6 +5,7 @@ import json
 import pyautogui
 import pyperclip
 import traceback
+from typing import Callable, Optional
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QLabel, QComboBox, QLineEdit, QScrollArea, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame)
@@ -14,87 +15,221 @@ from PySide6.QtCore import Qt, QThread, Signal
 # 核心逻辑 (原 waterRPA.py)
 # --------------------------
 
-def mouseClick(clickTimes, lOrR, img, reTry, timeout=60):
+
+class TaskStopped(Exception):
+    """用户请求停止任务（可取消执行）。"""
+
+
+class StepFailed(Exception):
+    """某个步骤执行失败（按策略：失败即停止整个任务）。"""
+
+
+def _is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _cancellable_sleep(
+    seconds: float,
+    should_stop: Optional[Callable[[], bool]] = None,
+    tick: float = 0.1,
+):
+    """分片 sleep，确保 stop 能在 tick 粒度内生效。"""
+    if seconds <= 0:
+        return
+    if tick <= 0:
+        tick = 0.1
+
+    end_time = time.time() + seconds
+    while True:
+        if should_stop and should_stop():
+            raise TaskStopped("任务已停止")
+
+        remaining = end_time - time.time()
+        if remaining <= 0:
+            return
+
+        time.sleep(min(tick, remaining))
+
+
+def _locate_center_on_screen(
+    img: str,
+    *,
+    confidence: float = 0.9,
+    on_warn: Optional[Callable[[str], None]] = None,
+):
     """
-    reTry: 1 (一次), -1 (无限), >1 (指定次数)
+    兼容 OpenCV/置信度参数不可用的场景：
+    - 优先使用 confidence（更稳定）
+    - 若环境不支持（常见：未安装 OpenCV），降级为不带 confidence 的匹配并提示一次
+    """
+    if not img:
+        return None
+
+    # 如果给的是文件路径（绝对或相对），尽早发现明显的文件缺失问题
+    # 允许用户传入非文件路径（例如某些自定义方式），此时不做存在性校验
+    if any(sep in img for sep in ("/", "\\")) and not os.path.exists(img):
+        raise StepFailed(f"图片文件不存在: {img}")
+
+    try:
+        return pyautogui.locateCenterOnScreen(img, confidence=confidence)
+    except Exception as e:
+        # 典型报错：confidence 参数仅在安装 OpenCV 时可用
+        msg = str(e)
+        if "confidence" in msg.lower() or "opencv" in msg.lower():
+            if on_warn:
+                on_warn("检测到环境不支持 confidence/OpenCV，已降级为不带置信度的找图。建议安装 opencv-python 提升稳定性。")
+            try:
+                return pyautogui.locateCenterOnScreen(img)
+            except pyautogui.ImageNotFoundException:
+                return None
+        raise
+
+
+def mouseClick(
+    clickTimes,
+    lOrR,
+    img,
+    reTry,
+    timeout=60,
+    should_stop: Optional[Callable[[], bool]] = None,
+    on_warn: Optional[Callable[[str], None]] = None,
+):
+    """
+    安全统一语义：reTry 仅代表“找图重试策略”，不承载“重复点击”语义。
+
+    reTry:
+      - 1: 只尝试一次，找不到则失败
+      - >1: 最多尝试 N 次，找到则点击一次并继续
+      - -1: 无限等待直到首次匹配成功，点击一次并继续
+
     timeout: 超时时间(秒)，默认60秒。防止无限卡死。
     """
     start_time = time.time()
-    
-    if reTry == 1:
+
+    # 规范化 reTry
+    try:
+        reTry = int(reTry)
+    except Exception:
+        reTry = 1
+
+    if reTry == 0 or reTry < -1:
+        reTry = 1
+
+    def _check_timeout():
+        if timeout and (time.time() - start_time > timeout):
+            raise StepFailed(f"等待图片超时 ({timeout}秒): {img}")
+
+    # reTry=-1：无限等待直到成功（但仍受 timeout/stop 影响）
+    if reTry == -1:
         while True:
-            # 检查超时
-            if timeout and (time.time() - start_time > timeout):
-                print(f"等待图片 {img} 超时 ({timeout}秒)")
-                return # 或者抛出异常
-            
-            try:
-                location=pyautogui.locateCenterOnScreen(img,confidence=0.9)
-                if location is not None:
-                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.2,duration=0.2,button=lOrR)
-                    break
-            except pyautogui.ImageNotFoundException:
-                pass # 没找到，继续重试
-            
-            print("未找到匹配图片,0.1秒后重试")
-            time.sleep(0.1)
-    elif reTry == -1:
-        while True:
-            # 无限重试通常也需要某种中断机制，这里保留原意但增加超时保护（可选）
-            # 如果确实想“死等”，可以把 timeout 设为 None
-            if timeout and (time.time() - start_time > timeout):
-                print(f"等待图片 {img} 超时 ({timeout}秒)")
-                return 
+            if should_stop and should_stop():
+                raise TaskStopped("任务已停止")
+            _check_timeout()
 
             try:
-                location=pyautogui.locateCenterOnScreen(img,confidence=0.9)
-                if location is not None:
-                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.2,duration=0.2,button=lOrR)
+                location = _locate_center_on_screen(img, on_warn=on_warn)
             except pyautogui.ImageNotFoundException:
-                pass
+                location = None
 
-            time.sleep(0.1)
-    elif reTry > 1:
-        i = 1
-        while i < reTry + 1:
-            if timeout and (time.time() - start_time > timeout):
-                print(f"操作超时 ({timeout}秒)")
+            if location is not None:
+                pyautogui.click(
+                    location.x,
+                    location.y,
+                    clicks=clickTimes,
+                    interval=0.2,
+                    duration=0.2,
+                    button=lOrR,
+                )
                 return
 
-            try:
-                location=pyautogui.locateCenterOnScreen(img,confidence=0.9)
-                if location is not None:
-                    pyautogui.click(location.x,location.y,clicks=clickTimes,interval=0.2,duration=0.2,button=lOrR)
-                    print("重复")
-                    i += 1
-            except pyautogui.ImageNotFoundException:
-                pass
-            
-            time.sleep(0.1)
+            _cancellable_sleep(0.1, should_stop)
 
-def mouseMove(img, reTry, timeout=60):
+    # reTry>=1：有限次尝试
+    for attempt in range(reTry):
+        if should_stop and should_stop():
+            raise TaskStopped("任务已停止")
+        _check_timeout()
+
+        try:
+            location = _locate_center_on_screen(img, on_warn=on_warn)
+        except pyautogui.ImageNotFoundException:
+            location = None
+
+        if location is not None:
+            pyautogui.click(
+                location.x,
+                location.y,
+                clicks=clickTimes,
+                interval=0.2,
+                duration=0.2,
+                button=lOrR,
+            )
+            return
+
+        if attempt < reTry - 1:
+            _cancellable_sleep(0.1, should_stop)
+
+    raise StepFailed(f"未找到匹配图片: {img}")
+
+
+def mouseMove(
+    img,
+    reTry,
+    timeout=60,
+    should_stop: Optional[Callable[[], bool]] = None,
+    on_warn: Optional[Callable[[str], None]] = None,
+):
     """
     鼠标悬停（移动但不点击）
     """
     start_time = time.time()
-    while True:
-        if timeout and (time.time() - start_time > timeout):
-            print(f"等待图片 {img} 超时 ({timeout}秒)")
-            return
+    try:
+        reTry = int(reTry)
+    except Exception:
+        reTry = 1
 
-        try:
-            location = pyautogui.locateCenterOnScreen(img, confidence=0.9)
+    if reTry == 0 or reTry < -1:
+        reTry = 1
+
+    def _check_timeout():
+        if timeout and (time.time() - start_time > timeout):
+            raise StepFailed(f"等待图片超时 ({timeout}秒): {img}")
+
+    if reTry == -1:
+        while True:
+            if should_stop and should_stop():
+                raise TaskStopped("任务已停止")
+            _check_timeout()
+
+            try:
+                location = _locate_center_on_screen(img, on_warn=on_warn)
+            except pyautogui.ImageNotFoundException:
+                location = None
+
             if location is not None:
                 pyautogui.moveTo(location.x, location.y, duration=0.2)
-                break
-        except pyautogui.ImageNotFoundException:
-            pass
+                return
 
-        print("未找到匹配图片,0.1秒后重试")
-        time.sleep(0.1)
-        if reTry == 1: # 如果只试一次且没找到，直接退出（或者遵循原逻辑死循环？原mouseClick逻辑是reTry=1也会死循环直到找到，这里保持一致）
-            pass 
-        # 注意：原mouseClick中 reTry=1 也是 while True，直到找到。这里保持一致。
+            _cancellable_sleep(0.1, should_stop)
+
+    for attempt in range(reTry):
+        if should_stop and should_stop():
+            raise TaskStopped("任务已停止")
+        _check_timeout()
+
+        try:
+            location = _locate_center_on_screen(img, on_warn=on_warn)
+        except pyautogui.ImageNotFoundException:
+            location = None
+
+        if location is not None:
+            pyautogui.moveTo(location.x, location.y, duration=0.2)
+            return
+
+        if attempt < reTry - 1:
+            _cancellable_sleep(0.1, should_stop)
+
+    raise StepFailed(f"未找到匹配图片: {img}")
 
 class RPAEngine:
     def __init__(self):
@@ -115,7 +250,20 @@ class RPAEngine:
         """
         self.is_running = True
         self.stop_requested = False
-        
+
+        def should_stop() -> bool:
+            return bool(self.stop_requested)
+
+        # 用于输出一次性的降级提示（例如 OpenCV 不可用）
+        warned_messages = set()
+
+        def warn_once(msg: str):
+            if msg in warned_messages:
+                return
+            warned_messages.add(msg)
+            if callback_msg:
+                callback_msg(f"提示: {msg}")
+
         try:
             while True:
                 for idx, task in enumerate(tasks):
@@ -130,66 +278,92 @@ class RPAEngine:
                     if callback_msg:
                         callback_msg(f"执行步骤 {idx+1}: 类型={cmd_type}, 内容={cmd_value}")
 
-                    if cmd_type == 1.0: # 单击左键
-                        mouseClick(1, "left", cmd_value, retry)
-                        if callback_msg: callback_msg(f"单击左键: {cmd_value}")
-                    
-                    elif cmd_type == 2.0: # 双击左键
-                        mouseClick(2, "left", cmd_value, retry)
-                        if callback_msg: callback_msg(f"双击左键: {cmd_value}")
-                    
-                    elif cmd_type == 3.0: # 右键
-                        mouseClick(1, "right", cmd_value, retry)
-                        if callback_msg: callback_msg(f"右键单击: {cmd_value}")
-                    
-                    elif cmd_type == 4.0: # 输入
-                        pyperclip.copy(str(cmd_value))
-                        pyautogui.hotkey('ctrl', 'v')
-                        time.sleep(0.5)
-                        if callback_msg: callback_msg(f"输入文本: {cmd_value}")
-                    
-                    elif cmd_type == 5.0: # 等待
-                        sleep_time = float(cmd_value)
-                        time.sleep(sleep_time)
-                        if callback_msg: callback_msg(f"等待 {sleep_time} 秒")
-                    
-                    elif cmd_type == 6.0: # 滚轮
-                        scroll_val = int(cmd_value)
-                        pyautogui.scroll(scroll_val)
-                        if callback_msg: callback_msg(f"滚轮滑动 {scroll_val}")
-
-                    elif cmd_type == 7.0: # 系统按键 (组合键)
-                        keys = str(cmd_value).lower().split('+')
-                        # 去除空格
-                        keys = [k.strip() for k in keys]
-                        pyautogui.hotkey(*keys)
-                        if callback_msg: callback_msg(f"按键组合: {cmd_value}")
-
-                    elif cmd_type == 8.0: # 鼠标悬停
-                        mouseMove(cmd_value, retry)
-                        if callback_msg: callback_msg(f"鼠标悬停: {cmd_value}")
-
-                    elif cmd_type == 9.0: # 截图保存
-                        path = str(cmd_value)
-                        # 如果是目录，自动拼接时间戳文件名
-                        if os.path.isdir(path):
-                            timestamp = time.strftime("%Y%m%d_%H%M%S")
-                            filename = os.path.join(path, f"screenshot_{timestamp}.png")
-                        else:
-                            # 兼容旧逻辑：如果用户直接输入了带文件名的路径
-                            filename = path
-                            if not filename.endswith(('.png', '.jpg', '.bmp')):
-                                filename += '.png'
+                    try:
+                        if cmd_type == 1.0: # 单击左键
+                            mouseClick(1, "left", cmd_value, retry, should_stop=should_stop, on_warn=warn_once)
+                            if callback_msg: callback_msg(f"单击左键: {cmd_value}")
                         
-                        pyautogui.screenshot(filename)
-                        if callback_msg: callback_msg(f"截图已保存: {filename}")
+                        elif cmd_type == 2.0: # 双击左键
+                            mouseClick(2, "left", cmd_value, retry, should_stop=should_stop, on_warn=warn_once)
+                            if callback_msg: callback_msg(f"双击左键: {cmd_value}")
+                        
+                        elif cmd_type == 3.0: # 右键
+                            mouseClick(1, "right", cmd_value, retry, should_stop=should_stop, on_warn=warn_once)
+                            if callback_msg: callback_msg(f"右键单击: {cmd_value}")
+                        
+                        elif cmd_type == 4.0: # 输入
+                            pyperclip.copy(str(cmd_value))
+                            if _is_macos():
+                                pyautogui.hotkey("command", "v")
+                            else:
+                                pyautogui.hotkey("ctrl", "v")
+                            _cancellable_sleep(0.5, should_stop)
+                            if callback_msg: callback_msg(f"输入文本: {cmd_value}")
+                        
+                        elif cmd_type == 5.0: # 等待
+                            sleep_time = float(cmd_value)
+                            _cancellable_sleep(sleep_time, should_stop)
+                            if callback_msg: callback_msg(f"等待 {sleep_time} 秒")
+                        
+                        elif cmd_type == 6.0: # 滚轮
+                            scroll_val = int(cmd_value)
+                            pyautogui.scroll(scroll_val)
+                            if callback_msg: callback_msg(f"滚轮滑动 {scroll_val}")
+
+                        elif cmd_type == 7.0: # 系统按键 (组合键)
+                            keys = str(cmd_value).lower().split('+')
+                            # 去除空格
+                            keys = [k.strip() for k in keys]
+                            # 轻量兼容别名：cmd/control/option 等
+                            key_alias = {
+                                "cmd": "command",
+                                "command": "command",
+                                "ctl": "ctrl",
+                                "control": "ctrl",
+                                "option": "alt",
+                                "win": "winleft",
+                                "windows": "winleft",
+                                "super": "winleft",
+                            }
+                            keys = [key_alias.get(k, k) for k in keys if k]
+                            pyautogui.hotkey(*keys)
+                            if callback_msg: callback_msg(f"按键组合: {cmd_value}")
+
+                        elif cmd_type == 8.0: # 鼠标悬停
+                            mouseMove(cmd_value, retry, should_stop=should_stop, on_warn=warn_once)
+                            if callback_msg: callback_msg(f"鼠标悬停: {cmd_value}")
+
+                        elif cmd_type == 9.0: # 截图保存
+                            path = str(cmd_value)
+                            # 如果是目录，自动拼接时间戳文件名
+                            if os.path.isdir(path):
+                                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                                filename = os.path.join(path, f"screenshot_{timestamp}.png")
+                            else:
+                                # 兼容旧逻辑：如果用户直接输入了带文件名的路径
+                                filename = path
+                                if not filename.endswith(('.png', '.jpg', '.bmp')):
+                                    filename += '.png'
+                            
+                            pyautogui.screenshot(filename)
+                            if callback_msg: callback_msg(f"截图已保存: {filename}")
+                        else:
+                            raise StepFailed(f"未知指令类型: {cmd_type}")
+
+                    except StepFailed as e:
+                        if callback_msg:
+                            callback_msg(f"步骤 {idx+1} 失败: 类型={cmd_type}, 内容={cmd_value}, 原因={e}")
+                        return
 
                 if not loop_forever:
                     break
                 
                 if callback_msg: callback_msg("等待 0.1 秒进入下一轮循环...")
-                time.sleep(0.1)
+                _cancellable_sleep(0.1, should_stop)
                 
+        except TaskStopped:
+            if callback_msg:
+                callback_msg("任务已停止")
         except Exception as e:
             if callback_msg: callback_msg(f"执行出错: {e}")
             traceback.print_exc()

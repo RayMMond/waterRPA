@@ -1,0 +1,51 @@
+name: build-windows-exe
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      PYTHONIOENCODING: "utf-8"
+      PIP_NO_COMPILE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: "pip"
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --no-compile -r requirements.txt
+          python -m pip install --upgrade pyinstaller
+
+      - name: Build Windows exe (onefile, windowed)
+        shell: pwsh
+        run: |
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --windowed `
+            --name waterRPA_GUI `
+            --distpath "dist/win" `
+            --workpath "build/win" `
+            --specpath "build/win_spec" `
+            "waterRPA_GUI.py"
+
+      - name: Upload artifact (dist/win)
+        uses: actions/upload-artifact@v4
+        with:
+          name: waterRPA_GUI-windows
+          path: dist/win/**
+          if-no-files-found: error

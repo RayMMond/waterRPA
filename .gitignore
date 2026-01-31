@@ -7,6 +7,9 @@ build/
 dist/
 *.spec
 
+# Assets
+img/
+
 # OS / IDE
 .DS_Store
 .idea/

@@ -6,6 +6,7 @@ import pyautogui
 import pyperclip
 import traceback
 from typing import Callable, Optional
+import subprocess
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QLabel, QComboBox, QLineEdit, QScrollArea, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame)
@@ -14,6 +15,28 @@ from PySide6.QtCore import Qt, QThread, Signal
 # --------------------------
 # 核心逻辑 (原 waterRPA.py)
 # --------------------------
+
+def _get_frontmost_app_name() -> Optional[str]:
+    """macOS: 获取最前台应用名（用于判断是否只是激活窗口而未触发控件）。"""
+    if not _is_macos():
+        return None
+    try:
+        res = subprocess.run(
+            [
+                "osascript",
+                "-e",
+                "tell application \"System Events\" to get name of first application process whose frontmost is true",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+        if res.returncode != 0:
+            return None
+        name = (res.stdout or "").strip()
+        return name or None
+    except Exception:
+        return None
 
 
 class TaskStopped(Exception):
@@ -49,6 +72,27 @@ def _cancellable_sleep(
             return
 
         time.sleep(min(tick, remaining))
+
+
+def _normalize_xy_for_macos_retina(
+    x: float,
+    y: float,
+    *,
+    scale_x: Optional[float],
+    scale_y: Optional[float],
+) -> tuple:
+    """
+    macOS Retina 常见现象：截图像素坐标是屏幕点坐标的 2 倍。
+    若检测到 scale != 1，则把 locate 的坐标缩放回屏幕坐标。
+    """
+    if not _is_macos():
+        return x, y
+    if not scale_x or not scale_y:
+        return x, y
+    if abs(scale_x - 1.0) < 0.01 and abs(scale_y - 1.0) < 0.01:
+        return x, y
+
+    return x / scale_x, y / scale_y
 
 
 def _locate_center_on_screen(
@@ -93,6 +137,8 @@ def mouseClick(
     timeout=60,
     should_stop: Optional[Callable[[], bool]] = None,
     on_warn: Optional[Callable[[str], None]] = None,
+    scale_x: Optional[float] = None,
+    scale_y: Optional[float] = None,
 ):
     """
     安全统一语义：reTry 仅代表“找图重试策略”，不承载“重复点击”语义。
@@ -132,14 +178,33 @@ def mouseClick(
                 location = None
 
             if location is not None:
-                pyautogui.click(
+                nx, ny = _normalize_xy_for_macos_retina(
                     location.x,
                     location.y,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                )
+                pre_app = _get_frontmost_app_name()
+                pyautogui.click(
+                    int(round(nx)),
+                    int(round(ny)),
                     clicks=clickTimes,
                     interval=0.2,
                     duration=0.2,
                     button=lOrR,
                 )
+                post_app = _get_frontmost_app_name()
+                # 如果本次点击导致前台应用切换，常见现象是“第一次点击只激活窗口”
+                # 这里做一次无延迟的补偿点击，尽量让控件动作生效。
+                if pre_app and post_app and pre_app != post_app:
+                    pyautogui.click(
+                        int(round(nx)),
+                        int(round(ny)),
+                        clicks=clickTimes,
+                        interval=0.2,
+                        duration=0.2,
+                        button=lOrR,
+                    )
                 return
 
             _cancellable_sleep(0.1, should_stop)
@@ -156,14 +221,31 @@ def mouseClick(
             location = None
 
         if location is not None:
-            pyautogui.click(
+            nx, ny = _normalize_xy_for_macos_retina(
                 location.x,
                 location.y,
+                scale_x=scale_x,
+                scale_y=scale_y,
+            )
+            pre_app = _get_frontmost_app_name()
+            pyautogui.click(
+                int(round(nx)),
+                int(round(ny)),
                 clicks=clickTimes,
                 interval=0.2,
                 duration=0.2,
                 button=lOrR,
             )
+            post_app = _get_frontmost_app_name()
+            if pre_app and post_app and pre_app != post_app:
+                pyautogui.click(
+                    int(round(nx)),
+                    int(round(ny)),
+                    clicks=clickTimes,
+                    interval=0.2,
+                    duration=0.2,
+                    button=lOrR,
+                )
             return
 
         if attempt < reTry - 1:
@@ -178,6 +260,8 @@ def mouseMove(
     timeout=60,
     should_stop: Optional[Callable[[], bool]] = None,
     on_warn: Optional[Callable[[str], None]] = None,
+    scale_x: Optional[float] = None,
+    scale_y: Optional[float] = None,
 ):
     """
     鼠标悬停（移动但不点击）
@@ -207,7 +291,13 @@ def mouseMove(
                 location = None
 
             if location is not None:
-                pyautogui.moveTo(location.x, location.y, duration=0.2)
+                nx, ny = _normalize_xy_for_macos_retina(
+                    location.x,
+                    location.y,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
+                )
+                pyautogui.moveTo(int(round(nx)), int(round(ny)), duration=0.2)
                 return
 
             _cancellable_sleep(0.1, should_stop)
@@ -223,7 +313,13 @@ def mouseMove(
             location = None
 
         if location is not None:
-            pyautogui.moveTo(location.x, location.y, duration=0.2)
+            nx, ny = _normalize_xy_for_macos_retina(
+                location.x,
+                location.y,
+                scale_x=scale_x,
+                scale_y=scale_y,
+            )
+            pyautogui.moveTo(int(round(nx)), int(round(ny)), duration=0.2)
             return
 
         if attempt < reTry - 1:
@@ -265,6 +361,19 @@ class RPAEngine:
                 callback_msg(f"提示: {msg}")
 
         try:
+            screen_w, screen_h = pyautogui.size()
+        except Exception:
+            screen_w, screen_h = None, None
+        try:
+            shot = pyautogui.screenshot()
+            shot_w, shot_h = shot.size
+        except Exception:
+            shot_w, shot_h = None, None
+
+        scale_x = (shot_w / screen_w) if (shot_w and screen_w) else None
+        scale_y = (shot_h / screen_h) if (shot_h and screen_h) else None
+
+        try:
             while True:
                 for idx, task in enumerate(tasks):
                     if self.stop_requested:
@@ -280,15 +389,42 @@ class RPAEngine:
 
                     try:
                         if cmd_type == 1.0: # 单击左键
-                            mouseClick(1, "left", cmd_value, retry, should_stop=should_stop, on_warn=warn_once)
+                            mouseClick(
+                                1,
+                                "left",
+                                cmd_value,
+                                retry,
+                                should_stop=should_stop,
+                                on_warn=warn_once,
+                                scale_x=scale_x,
+                                scale_y=scale_y,
+                            )
                             if callback_msg: callback_msg(f"单击左键: {cmd_value}")
                         
                         elif cmd_type == 2.0: # 双击左键
-                            mouseClick(2, "left", cmd_value, retry, should_stop=should_stop, on_warn=warn_once)
+                            mouseClick(
+                                2,
+                                "left",
+                                cmd_value,
+                                retry,
+                                should_stop=should_stop,
+                                on_warn=warn_once,
+                                scale_x=scale_x,
+                                scale_y=scale_y,
+                            )
                             if callback_msg: callback_msg(f"双击左键: {cmd_value}")
                         
                         elif cmd_type == 3.0: # 右键
-                            mouseClick(1, "right", cmd_value, retry, should_stop=should_stop, on_warn=warn_once)
+                            mouseClick(
+                                1,
+                                "right",
+                                cmd_value,
+                                retry,
+                                should_stop=should_stop,
+                                on_warn=warn_once,
+                                scale_x=scale_x,
+                                scale_y=scale_y,
+                            )
                             if callback_msg: callback_msg(f"右键单击: {cmd_value}")
                         
                         elif cmd_type == 4.0: # 输入
@@ -330,7 +466,14 @@ class RPAEngine:
                             if callback_msg: callback_msg(f"按键组合: {cmd_value}")
 
                         elif cmd_type == 8.0: # 鼠标悬停
-                            mouseMove(cmd_value, retry, should_stop=should_stop, on_warn=warn_once)
+                            mouseMove(
+                                cmd_value,
+                                retry,
+                                should_stop=should_stop,
+                                on_warn=warn_once,
+                                scale_x=scale_x,
+                                scale_y=scale_y,
+                            )
                             if callback_msg: callback_msg(f"鼠标悬停: {cmd_value}")
 
                         elif cmd_type == 9.0: # 截图保存
